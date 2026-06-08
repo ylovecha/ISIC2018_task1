@@ -1,0 +1,6 @@
+data/
+checkpoints/
+predictions/
+__pycache__/
+*.pyc
+.DS_Store
