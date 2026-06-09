@@ -4,14 +4,16 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
+from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
 from model import UNet
+from model_resnet_unet import ResNetUNet
 from dataset import ISIC2018Dataset
 from utils import dice_coefficient, iou_score, pixel_accuracy, DiceBCELoss
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device):
+def train_one_epoch(model, loader, optimizer, criterion, device, scaler=None, use_amp=False):
     model.train()
     total_loss = 0
     total_dice = 0
@@ -22,10 +24,19 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
         masks = masks.to(device)
 
         optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, masks)
-        loss.backward()
-        optimizer.step()
+
+        if use_amp:
+            with autocast():
+                outputs = model(images)
+                loss = criterion(outputs, masks)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            outputs = model(images)
+            loss = criterion(outputs, masks)
+            loss.backward()
+            optimizer.step()
 
         total_loss += loss.item()
         total_dice += dice_coefficient(outputs, masks)
@@ -35,7 +46,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
     return total_loss / n, total_dice / n, total_iou / n
 
 
-def validate(model, loader, criterion, device):
+def validate(model, loader, criterion, device, use_amp=False):
     model.eval()
     total_loss = 0
     total_dice = 0
@@ -46,8 +57,13 @@ def validate(model, loader, criterion, device):
             images = images.to(device)
             masks = masks.to(device)
 
-            outputs = model(images)
-            loss = criterion(outputs, masks)
+            if use_amp:
+                with autocast():
+                    outputs = model(images)
+                    loss = criterion(outputs, masks)
+            else:
+                outputs = model(images)
+                loss = criterion(outputs, masks)
 
             total_loss += loss.item()
             total_dice += dice_coefficient(outputs, masks)
@@ -67,7 +83,6 @@ def main(args):
     use_split_val = not os.path.exists(args.val_mask_dir)
     if use_split_val:
         print(f"Validation mask dir '{args.val_mask_dir}' not found — splitting training data (90/10).")
-        # Create two datasets with the same files but different augmentation modes
         full_train_ds = ISIC2018Dataset(
             img_dir=args.train_img_dir, mask_dir=args.train_mask_dir,
             img_size=args.img_size, mode='train'
@@ -97,14 +112,27 @@ def main(args):
             mode='val'
         )
 
-    num_workers = 2  # Use multiprocessing for faster data loading
+    num_workers = 2
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
 
-    model = UNet(in_channels=3, out_channels=1).to(device)
+    # Model selection
+    if args.model == 'resnet_unet':
+        model = ResNetUNet(in_channels=3, out_channels=1, pretrained=True).to(device)
+        print(f"Using ResNetUNet (pre-trained ResNet34 encoder)")
+    else:
+        model = UNet(in_channels=3, out_channels=1).to(device)
+        print(f"Using standard UNet")
+
     criterion = DiceBCELoss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+
+    # AMP only available on CUDA
+    use_amp = args.amp and device.type == 'cuda'
+    scaler = GradScaler() if use_amp else None
+    if use_amp:
+        print("Using Automatic Mixed Precision (AMP)")
 
     best_dice = 0.0
     print(f"Training for {args.epochs} epochs...")
@@ -113,8 +141,12 @@ def main(args):
     for epoch in range(1, args.epochs + 1):
         print(f"\nEpoch [{epoch}/{args.epochs}]")
 
-        train_loss, train_dice, train_iou = train_one_epoch(model, train_loader, optimizer, criterion, device)
-        val_loss, val_dice, val_iou = validate(model, val_loader, criterion, device)
+        train_loss, train_dice, train_iou = train_one_epoch(
+            model, train_loader, optimizer, criterion, device, scaler, use_amp
+        )
+        val_loss, val_dice, val_iou = validate(
+            model, val_loader, criterion, device, use_amp
+        )
 
         scheduler.step(val_loss)
         current_lr = optimizer.param_groups[0]['lr']
@@ -130,6 +162,7 @@ def main(args):
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'best_dice': best_dice,
+                'model_type': args.model,
             }, os.path.join(args.save_dir, 'best_model.pth'))
             print(f"Best model saved with Dice: {best_dice:.4f}")
 
@@ -137,13 +170,16 @@ def main(args):
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
+            'model_type': args.model,
         }, os.path.join(args.save_dir, 'last_model.pth'))
 
     print(f"\nTraining complete. Best Dice: {best_dice:.4f}")
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Train U-Net for ISIC2018 Task1')
+    parser = argparse.ArgumentParser(description='Train U-Net / ResNetUNet for ISIC2018 Task1')
+    parser.add_argument('--model', type=str, default='resnet_unet', choices=['unet', 'resnet_unet'],
+                        help='Model architecture (default: resnet_unet)')
     parser.add_argument('--train_img_dir', type=str, default='data/ISIC2018_Task1-2_Training_Input')
     parser.add_argument('--train_mask_dir', type=str, default='data/ISIC2018_Task1_Training_GroundTruth')
     parser.add_argument('--val_img_dir', type=str, default='data/ISIC2018_Task1-2_Validation_Input')
@@ -153,5 +189,7 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--save_dir', type=str, default='checkpoints')
+    parser.add_argument('--amp', action='store_true', default=True,
+                        help='Use Automatic Mixed Precision (default: True)')
     args = parser.parse_args()
     main(args)

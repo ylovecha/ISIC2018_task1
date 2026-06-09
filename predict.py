@@ -7,6 +7,7 @@ from torchvision import transforms
 from tqdm import tqdm
 
 from model import UNet
+from model_resnet_unet import ResNetUNet
 from dataset import ISIC2018Dataset
 from torch.utils.data import DataLoader
 from utils import dice_coefficient, iou_score, pixel_accuracy
@@ -87,11 +88,14 @@ def main(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    model = UNet(in_channels=3, out_channels=1).to(device)
-
     checkpoint = torch.load(args.model_path, map_location=device)
+    model_type = checkpoint.get('model_type', 'unet')
+    if model_type == 'resnet_unet':
+        model = ResNetUNet(in_channels=3, out_channels=1, pretrained=False).to(device)
+    else:
+        model = UNet(in_channels=3, out_channels=1).to(device)
     model.load_state_dict(checkpoint['model_state_dict'])
-    print(f"Loaded model from {args.model_path}")
+    print(f"Loaded {model_type} from {args.model_path} (best Dice: {checkpoint.get('best_dice', 'N/A')})")
 
     if args.single_image:
         pred_img = predict_single(model, args.single_image, args.img_size, device)
